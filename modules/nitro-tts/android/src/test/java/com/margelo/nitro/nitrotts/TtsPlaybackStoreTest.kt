@@ -16,6 +16,7 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28], manifest = Config.NONE)
 class TtsPlaybackStoreTest {
+    private fun sample(index: Int) = "text$index" + "x".repeat(1795)
     private lateinit var engine: TextToSpeech
     private val spoken = mutableListOf<String>()
     private val ids = mutableListOf<String>()
@@ -46,7 +47,7 @@ class TtsPlaybackStoreTest {
         set("isReady", true)
         set("boundEngineName", null)
         set("settings", TtsSettings(null, null, 1.0, 1.0))
-        set("paragraphs", (0..5).map { TtsParagraph("p$it", "text$it") })
+        set("paragraphs", (0..5).map { TtsParagraph("p$it", sample(it)) })
         set("currentIndex", 0)
         set("state", TtsPlaybackState.PAUSED)
         set("hasAudioFocus", true)
@@ -58,7 +59,7 @@ class TtsPlaybackStoreTest {
 
     @Test fun preloadsBeforeFirstParagraphFinishes() {
         TtsPlaybackStore.play()
-        assertEquals(listOf("text0", "text1", "text2"), spoken)
+        assertEquals((0..2).map(::sample), spoken)
         assertEquals(0.0, TtsPlaybackStore.snapshot().progress!!.index, 0.0)
     }
 
@@ -67,7 +68,7 @@ class TtsPlaybackStoreTest {
         clearInvocations(engine)
         listener().onDone(ids[0])
         verify(engine, never()).stop()
-        assertEquals(listOf("text0", "text1", "text2", "text3"), spoken)
+        assertEquals((0..3).map(::sample), spoken)
         assertEquals(1.0, TtsPlaybackStore.snapshot().progress!!.index, 0.0)
     }
 
@@ -81,7 +82,7 @@ class TtsPlaybackStoreTest {
         TtsPlaybackStore.seekTo(4)
         old.forEach { listener().onDone(it) }
         assertEquals(4.0, TtsPlaybackStore.snapshot().progress!!.index, 0.0)
-        assertEquals(listOf("text4", "text5"), spoken.takeLast(2))
+        assertEquals((4..5).map(::sample), spoken.takeLast(2))
     }
 
     @Test fun settingsChangeRebuildsQueueAndIgnoresPreviousGeneration() {
@@ -92,7 +93,7 @@ class TtsPlaybackStoreTest {
         verify(engine).setSpeechRate(1.5f)
         verify(engine).setPitch(0.9f)
         assertEquals(0.0, TtsPlaybackStore.snapshot().progress!!.index, 0.0)
-        assertEquals(listOf("text0", "text1", "text2"), spoken.takeLast(3))
+        assertEquals((0..2).map(::sample), spoken.takeLast(3))
     }
 
     @Test fun stopDiscardsEntireLookahead() {
@@ -103,6 +104,33 @@ class TtsPlaybackStoreTest {
         assertEquals(TtsPlaybackState.IDLE, TtsPlaybackStore.snapshot().state)
         assertNull(TtsPlaybackStore.snapshot().progress)
         assertEquals(3, spoken.size)
+    }
+
+    @Test fun joinsRealParagraphsAndRemovesLineBreaksBeforeSpeaking() {
+        set("paragraphs", listOf(
+            TtsParagraph("a", "First.\n\nSecond."),
+            TtsParagraph("b", "Third.\r\n\r\nFourth."),
+        ))
+        TtsPlaybackStore.play()
+        assertEquals(listOf("First. Second. Third. Fourth."), spoken)
+        assertEquals(0.0, TtsPlaybackStore.snapshot().progress!!.index, 0.0)
+        listener().onDone(ids.single())
+        assertEquals(1.0, TtsPlaybackStore.snapshot().progress!!.index, 0.0)
+        assertEquals(TtsPlaybackState.COMPLETED, TtsPlaybackStore.snapshot().state)
+    }
+
+    @Test fun rangeCallbacksRetainOriginalParagraphSeekAndResume() {
+        set("paragraphs", listOf(TtsParagraph("a", "First."), TtsParagraph("b", "Second.")))
+        TtsPlaybackStore.play()
+        val old = ids.single()
+        listener().onRangeStart(old, 7, 14, 0)
+        assertEquals(1.0, TtsPlaybackStore.snapshot().progress!!.index, 0.0)
+        TtsPlaybackStore.pause()
+        set("hasAudioFocus", true)
+        TtsPlaybackStore.play()
+        assertEquals("Second.", spoken.last())
+        listener().onRangeStart(old, 0, 6, 0)
+        assertEquals(1.0, TtsPlaybackStore.snapshot().progress!!.index, 0.0)
     }
 
     @Test fun completesExactlyOnceAtEnd() {

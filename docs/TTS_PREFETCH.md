@@ -1,87 +1,76 @@
-# Android TTS lookahead
+# Android continuous TTS, revision 2
 
-## Source analysis
+The first revision queued individual paragraphs ahead of playback. The user
+reported that long pauses remained with HayaiTTS on a physical phone.
 
-Analysis baseline: LNReader `dc394e8540d44902efc17b5a35485bdb0724bb00`;
-HayaiTTS `7d51b0f92f1f1fddba0dcfc082efdf1bf2ff1e34`.
+## Current implementation
 
-LNReader's Android `TtsPlaybackStore.advance()` previously waited for
-`UtteranceProgressListener.onDone()` before sending the next paragraph, and
-`speakCurrent()` always used `QUEUE_FLUSH`. No following paragraph could be
-synthesized by Android while the current paragraph was playing.
+`TtsSpeechChunks.build()` normalizes line breaks, tabs, nonbreaking spaces,
+Unicode paragraph/line separators and repeated whitespace to one space, then
+joins original paragraphs into larger speech requests. The displayed chapter
+and original paragraph IDs are unchanged. Existing punctuation is preserved;
+no silent utterances or extra paragraph pauses are inserted.
 
-HayaiTTS's `HayaiTtsService.onSynthesizeText()` calls `runtime.synthesize()` and
-only then sends the completed sample array through `streamPcm()`. Its runtime
-also offers streaming synthesis, but the framework service does not currently
-use that path. This makes just-in-time paragraph submission especially costly.
-HayaiTTS remains unmodified in this patch.
+Each request contains at most 1800 UTF-16 characters. HayaiTTS baseline
+`7d51b0f92f1f1fddba0dcfc082efdf1bf2ff1e34` silently truncates requests beyond
+2000 characters (`HayaiTtsService.MAX_TEXT_LENGTH`). Therefore sending an entire
+chapter as a single framework request would lose text. The chunker prefers
+sentence boundaries, then spaces, and splits oversized words without breaking
+UTF-16 surrogate pairs. It skips whitespace-only inputs and retains a mapping
+from each spoken range to the original paragraph index.
 
-## Change
+The Android store queues the current chunk plus two following chunks using
+`QUEUE_ADD`, replenishing the window without stopping the engine. Explicit
+seek/replay/settings changes rebuild the window from the requested original
+paragraph. Generation IDs invalidate canceled callbacks. `onRangeStart` updates
+paragraph progress when supported; otherwise progress stays at the chunk's
+first paragraph until the next chunk or chapter completion. HayaiTTS does not
+currently report word ranges, so highlighting and the position retained on
+pause/replay can be coarser than the original paragraph-at-a-time mode. Manual
+selection of an original paragraph still works. No timing-based highlighting
+is fabricated. iOS and HayaiTTS source are unmodified.
 
-At explicit playback start, replay, seek, or settings change, stop the old queue,
-invalidate its generation, apply the voice/rate/pitch, and enqueue the current
-paragraph plus up to two following paragraphs with `QUEUE_ADD`. On natural
-completion, advance progress and replenish the bounded window without stopping,
-rebinding, resetting voice settings, or changing generation. Progress still
-refers to the paragraph being read, not the furthest queued paragraph.
+This reduces paragraph-level synthesis boundaries; it does not prove gapless
+audio. Larger requests may increase first-audio latency because Hayai generates
+a complete audio array before passing PCM to Android. Model throughput, audio
+backpressure and sentence prosody can still produce pauses between chunks.
 
-Pause, stop, load, seeking, and settings changes invalidate old callbacks.
-Errors from any paragraph in the lookahead stop the queue rather than allowing
-later paragraphs to continue after a failed synthesis. Skipping beyond the end
-also cancels the lookahead. Existing JS interfaces and iOS behavior are unchanged.
+## Build and validation
 
-This uses Android's synthesis/playback queue; it does not implement a second
-PCM cache or claim to eliminate all silence. Audio buffering/backpressure,
-model throughput, device performance, and very short paragraphs can still
-limit useful synthesis overlap. Existing Android maximum utterance length
-limits remain; this patch does not concatenate a whole chapter into one request.
-
-## Build and tests
-
-Prerequisites: a full JDK 17 (including `javac`), Node >=22.11, pnpm,
-Android SDK platform/build tools 36, and the NDK/CMake versions requested by
-the project. Set `JAVA_HOME` and `ANDROID_HOME` for your installation.
+Prerequisites: JDK 17 including javac, Node >=22.11, pnpm, Android SDK/build tools
+36, and the NDK/CMake versions requested by the project.
 
 ```sh
 pnpm install --frozen-lockfile
-pnpm run check
-pnpm exec jest --selectProjects rn --runInBand
+pnpm run lint
+pnpm run type-check
 pnpm exec expo prebuild --platform android --no-install
 cd android
-./gradlew :nitro-tts:testDebugUnitTest
+./gradlew :nitro-tts:testDebugUnitTest --max-workers=2
 cd ..
 pnpm run build:tts:debug
 ```
 
-The standalone build script embeds JS, disables developer support in the
-generated Android entry point, and excludes Expo development launcher/menu
-modules from generated autolinking for this build. It retains the debug build/signing configuration,
-targets arm64-v8a, and changes only generated Android files for this build mode.
-The output is `android/app/build/outputs/apk/debug/app-debug.apk`.
-A normal debug build without that script may need Metro. The debug application
-identifier is the upstream debug identifier; it differs from the release app.
+The standalone build embeds JS, disables developer support and excludes Expo's
+development launcher/menu in the generated Android files. Its generated icon
+cleanup removes WebP duplicates when a PNG with the same resource name exists.
+Output: `android/app/build/outputs/apk/debug/app-debug.apk`, arm64-v8a, debug key.
 
-Native Robolectric/Mockito tests exercise the actual store callbacks and speech
-requests: initial lookahead, refill without stop, pause/seek stale events,
-settings invalidation, full stop, completion, and queued synthesis errors.
-They do not synthesize or play real audio.
+15 native tests passed: normalization, short paragraph packing, long text
+preservation and limits, Unicode surrogate safety, sentence/range boundaries,
+original paragraph seeking, initial lookahead, refill without stop, pause/seek
+cancellation, settings invalidation, stop, completion, queued failures, merged
+engine requests and range-based resume. Lint and TypeScript passed, with the
+same 30 existing lint warnings. The repository-wide formatting baseline still
+contains pre-existing issues. Native tests mock the engine and play no audio.
 
-## Required physical-device validation (not performed here)
+## Physical-device comparison still required
 
-1. Back up the reader library. Install the debug APK alongside the release app.
-2. Choose the same Hayai voice/model, speed and chapter for both versions.
-3. Test a chapter with short dialogue and long paragraphs; repeat three times
-   with a warm model and record cold start separately. Also compare a base engine.
-4. Capture audible output with an external recorder or supported device audio
-   capture. Measure end-of-speech to next speech onset at at least 30 paragraph
-   boundaries; report median, p95, maximum, and first-audio latency. A word's
-   natural prosody pause is not necessarily a synthesis delay.
-5. Test pause/resume, stop, next/previous, arbitrary paragraph seek, rate/pitch,
-   voice/engine change, chapter end/auto-next, screen off, notification controls,
-   and transient/permanent audio focus interruptions. No old queued speech should
-   leak after cancellation. Verify highlight/progress and no dropped or repeated text.
-6. If synthesis remains slower than playback, investigate Hayai's streaming path
-   with model-specific cancellation and PCM tests before changing the service.
-
-Do not describe playback as fluid or the pauses as fixed until those audio
-measurements and functional checks are complete.
+Use the same Hayai voice, rate and chapter for the official app, first patch
+and revision 2. Include blank lines, short dialogue, very long paragraphs,
+paragraphs without punctuation, and a chapter over 2000 characters. Check that
+the last sentence is read. Measure first-audio latency and at least 30 audible
+transitions (median, p95, maximum), separating paragraph and chunk boundaries.
+Test pause/resume, stop, seeking, rate/pitch/voice changes, notifications, audio
+focus interruptions, screen off and next chapter. Report highlighting accuracy.
+No real audio playback of revision 2 was tested in this environment.

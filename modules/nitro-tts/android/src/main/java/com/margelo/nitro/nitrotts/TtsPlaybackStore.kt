@@ -33,6 +33,8 @@ internal object TtsPlaybackStore {
     private var state = TtsPlaybackState.IDLE
     private var generation = 0L
     private var queuedThrough = -1
+    private var speechChunks: List<TtsSpeechChunk> = emptyList()
+    private var currentChunk = 0
 
     private var audioManager: AudioManager? = null
     private var audioFocusRequest: AudioFocusRequest? = null
@@ -194,6 +196,7 @@ internal object TtsPlaybackStore {
         generation += 1
         engine?.stop()
         paragraphs = emptyList()
+        speechChunks = emptyList()
         currentIndex = 0
         metadata = null
         state = TtsPlaybackState.IDLE
@@ -349,7 +352,14 @@ internal object TtsPlaybackStore {
 
     private fun speakCurrent() {
         generation += 1
-        queuedThrough = currentIndex - 1
+        queuedThrough = -1
+        currentChunk = 0
+        speechChunks = TtsSpeechChunks.build(paragraphs, currentIndex)
+        if (speechChunks.isEmpty()) {
+            completeQueue()
+            return
+        }
+        currentIndex = speechChunks.first().spans.first().paragraphIndex
         engine?.stop()
         val requestGeneration = generation
         if (engine == null || settings.engineName != boundEngineName) {
@@ -390,11 +400,11 @@ internal object TtsPlaybackStore {
     }
 
     private fun fillLookahead(activeEngine: TextToSpeech): Boolean {
-        val last = minOf(currentIndex + 2, paragraphs.lastIndex)
+        val last = minOf(currentChunk + 2, speechChunks.lastIndex)
         while (queuedThrough < last) {
             val index = queuedThrough + 1
             val result = activeEngine.speak(
-                paragraphs[index].text,
+                speechChunks[index].text,
                 TextToSpeech.QUEUE_ADD,
                 Bundle(),
                 utteranceId(generation, index),
@@ -424,14 +434,17 @@ internal object TtsPlaybackStore {
     }
 
     private fun advance(utteranceId: String) {
-        if (utteranceId != utteranceId(generation, currentIndex)) {
+        if (utteranceId != utteranceId(generation, currentChunk)) {
             return
         }
-        if (currentIndex >= paragraphs.lastIndex) {
+        if (currentChunk >= speechChunks.lastIndex) {
+            currentIndex = speechChunks.last().spans.last().paragraphIndex
+            emitProgress()
             completeQueue()
             return
         }
-        currentIndex += 1
+        currentChunk += 1
+        currentIndex = speechChunks[currentChunk].spans.first().paragraphIndex
         emitProgress()
         engine?.let { fillLookahead(it) }
     }
@@ -498,9 +511,20 @@ internal object TtsPlaybackStore {
     private val progressListener = object : UtteranceProgressListener() {
         override fun onStart(utteranceId: String) {
             runOnOwner {
-                if (utteranceId == utteranceId(generation, currentIndex)) {
+                if (utteranceId == utteranceId(generation, currentChunk)) {
                     state = TtsPlaybackState.PLAYING
                     emitState()
+                }
+            }
+        }
+
+        override fun onRangeStart(utteranceId: String, start: Int, end: Int, frame: Int) {
+            runOnOwner {
+                if (utteranceId != utteranceId(generation, currentChunk)) return@runOnOwner
+                val span = speechChunks.getOrNull(currentChunk)?.spans?.lastOrNull { it.start <= start }
+                if (span != null && currentIndex != span.paragraphIndex) {
+                    currentIndex = span.paragraphIndex
+                    emitProgress()
                 }
             }
         }
@@ -512,7 +536,7 @@ internal object TtsPlaybackStore {
         @Deprecated("Deprecated by Android")
         override fun onError(utteranceId: String) {
             runOnOwner {
-                if ((currentIndex..queuedThrough).any { utteranceId == utteranceId(generation, it) }) {
+                if ((currentChunk..queuedThrough).any { utteranceId == utteranceId(generation, it) }) {
                     fail("The text-to-speech engine failed while speaking.")
                 }
             }
@@ -520,7 +544,7 @@ internal object TtsPlaybackStore {
 
         override fun onError(utteranceId: String, errorCode: Int) {
             runOnOwner {
-                if ((currentIndex..queuedThrough).any { utteranceId == utteranceId(generation, it) }) {
+                if ((currentChunk..queuedThrough).any { utteranceId == utteranceId(generation, it) }) {
                     fail("The text-to-speech engine failed with error code $errorCode.")
                 }
             }
