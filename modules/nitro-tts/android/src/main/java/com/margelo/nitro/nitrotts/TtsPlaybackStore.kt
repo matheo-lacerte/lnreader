@@ -32,6 +32,7 @@ internal object TtsPlaybackStore {
     private var settings = TtsSettings(null, null, 1.0, 1.0)
     private var state = TtsPlaybackState.IDLE
     private var generation = 0L
+    private var queuedThrough = -1
 
     private var audioManager: AudioManager? = null
     private var audioFocusRequest: AudioFocusRequest? = null
@@ -183,6 +184,7 @@ internal object TtsPlaybackStore {
      * call ends instead of auto-resuming.
      */
     fun pause() {
+        generation += 1
         resumeOnFocusGain = false
         abandonAudioFocus()
         pauseEngine()
@@ -346,11 +348,21 @@ internal object TtsPlaybackStore {
     }
 
     private fun speakCurrent() {
+        generation += 1
+        queuedThrough = currentIndex - 1
+        engine?.stop()
+        val requestGeneration = generation
         if (engine == null || settings.engineName != boundEngineName) {
             pendingInitialization.add { result ->
                 result.fold(
-                    onSuccess = { speakCurrent() },
-                    onFailure = { fail("The selected text-to-speech engine failed to initialize.") },
+                    onSuccess = {
+                        if (generation == requestGeneration) speakCurrent()
+                    },
+                    onFailure = {
+                        if (generation == requestGeneration) {
+                            fail("The selected text-to-speech engine failed to initialize.")
+                        }
+                    },
                 )
             }
             bindEngine(settings.engineName)
@@ -363,29 +375,37 @@ internal object TtsPlaybackStore {
         }
 
         val activeEngine = checkNotNull(engine)
-        val paragraph = paragraphs[currentIndex]
-        generation += 1
-        val utteranceId = utteranceId(generation, currentIndex)
-
         activeEngine.setSpeechRate(settings.rate.toFloat().coerceIn(0.1f, 4.0f))
         activeEngine.setPitch(settings.pitch.toFloat().coerceIn(0.1f, 2.0f))
         applyVoice(activeEngine)
 
-        val result = activeEngine.speak(
-            paragraph.text,
-            TextToSpeech.QUEUE_FLUSH,
-            Bundle(),
-            utteranceId,
-        )
-        if (result == TextToSpeech.ERROR) {
-            fail("The text-to-speech engine rejected the current paragraph.")
-            return
-        }
+        // Android can synthesize queued requests while earlier audio plays.
+        // Bound the lookahead and never flush at natural paragraph boundaries.
+        if (!fillLookahead(activeEngine)) return
 
         state = TtsPlaybackState.PLAYING
         resumeOnFocusGain = false
         emitProgress()
         emitState()
+    }
+
+    private fun fillLookahead(activeEngine: TextToSpeech): Boolean {
+        val last = minOf(currentIndex + 2, paragraphs.lastIndex)
+        while (queuedThrough < last) {
+            val index = queuedThrough + 1
+            val result = activeEngine.speak(
+                paragraphs[index].text,
+                TextToSpeech.QUEUE_ADD,
+                Bundle(),
+                utteranceId(generation, index),
+            )
+            if (result == TextToSpeech.ERROR) {
+                fail("The text-to-speech engine rejected a queued paragraph.")
+                return false
+            }
+            queuedThrough = index
+        }
+        return true
     }
 
     private fun applyVoice(activeEngine: TextToSpeech) {
@@ -412,16 +432,22 @@ internal object TtsPlaybackStore {
             return
         }
         currentIndex += 1
-        speakCurrent()
+        emitProgress()
+        engine?.let { fillLookahead(it) }
     }
 
     private fun completeQueue() {
+        generation += 1
+        engine?.stop()
         state = TtsPlaybackState.COMPLETED
         emitState()
         applicationContext?.let { TtsPlaybackService.stop(it) }
     }
 
     private fun fail(message: String) {
+        generation += 1
+        engine?.stop()
+        abandonAudioFocus()
         state = TtsPlaybackState.ERROR
         errorListeners.emit(message)
         emitState()
@@ -486,7 +512,7 @@ internal object TtsPlaybackStore {
         @Deprecated("Deprecated by Android")
         override fun onError(utteranceId: String) {
             runOnOwner {
-                if (utteranceId == utteranceId(generation, currentIndex)) {
+                if ((currentIndex..queuedThrough).any { utteranceId == utteranceId(generation, it) }) {
                     fail("The text-to-speech engine failed while speaking.")
                 }
             }
@@ -494,7 +520,7 @@ internal object TtsPlaybackStore {
 
         override fun onError(utteranceId: String, errorCode: Int) {
             runOnOwner {
-                if (utteranceId == utteranceId(generation, currentIndex)) {
+                if ((currentIndex..queuedThrough).any { utteranceId == utteranceId(generation, it) }) {
                     fail("The text-to-speech engine failed with error code $errorCode.")
                 }
             }
