@@ -51,6 +51,11 @@ complète de pauses et le fonctionnement de toutes les commandes sur téléphone
 ne sont donc pas validés. Le fait que les tests passent ne prouve pas la
 fluidité audio ni l’absence de toute régression sur appareil.
 
+Les identifiants OAuth de build AniList et MyAnimeList n’ont pas été fournis.
+Leur code est conservé, mais les connexions à ces deux services ne sont pas
+opérationnelles dans cette APK tant que ces identifiants ne sont pas configurés
+et l’application recompilée. Les autres fonctions restent à vérifier sur appareil.
+
 La file permet à Android de préparer la synthèse suivante pendant la lecture,
 mais une génération plus lente que la lecture, de très courts paragraphes ou
 la contre-pression audio peuvent encore causer des pauses. Le chapitre n’est
