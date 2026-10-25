@@ -64,7 +64,7 @@ run(
   [
     ':app:assembleDebug',
     '-PreactNativeArchitectures=arm64-v8a',
-    '--max-workers=4',
+    '--max-workers=2',
   ],
   path.join(root, 'android'),
 );
